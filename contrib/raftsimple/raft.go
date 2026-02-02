@@ -2,16 +2,12 @@ package main
 
 import (
 	"context"
-	"errors"
 	"log"
-	"os"
 	"time"
 
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 )
-
-var defaultSnapshotCount uint64 = 10000
 
 type commit struct {
 	data       []string
@@ -53,6 +49,7 @@ type raftNode struct {
 	snapshotIndex uint64
 	appliedIndex  uint64
 	snapCount     uint64
+	t             transport
 
 	// When serveChannels is done, `err` is set to any error and then
 	// `done` is closed.
@@ -63,20 +60,22 @@ type raftNode struct {
 	node        raft.Node
 	raftStorage *raft.MemoryStorage
 
-	nw *network
-
 	stopc chan struct{} // signals proposal channel closed
 	// httpstopc chan struct{} // signals http server to shutdown
 	// httpdonec chan struct{} // signals http server shutdown complete
 }
 
-func newRaftNode(id uint64, peers []uint64, fsm FSM, ss snapshotStorage, proposeC <-chan string, confChangeC <-chan raftpb.ConfChange) *raftNode {
+var defaultSnapshotCount uint64 = 10000
+
+func newRaftNode(id uint64, peers []uint64, fsm FSM, ss snapshotStorage, nw *network, proposeC <-chan string, confChangeC <-chan raftpb.ConfChange) *raftNode {
 	commitC := make(chan *commit)
 	errorC := make(chan error)
 
+	t := transport{id: id, peers: make(map[uint64]bool, len(peers)), nw: nw}
 	rpeers := make([]raft.Peer, len(peers))
 	for i, pID := range peers {
 		rpeers[i] = raft.Peer{ID: pID}
+		t.peers[pID] = true
 	}
 
 	rc := &raftNode{
@@ -90,7 +89,7 @@ func newRaftNode(id uint64, peers []uint64, fsm FSM, ss snapshotStorage, propose
 		fsm:         fsm,
 		ss:          ss,
 		snapCount:   defaultSnapshotCount,
-		nw:          &network{peers: make(map[uint64]*raftNode)},
+		t:           t,
 		stopc:       make(chan struct{}),
 		// httpstopc:   make(chan struct{}),
 		// httpdonec:   make(chan struct{}),
@@ -100,20 +99,6 @@ func newRaftNode(id uint64, peers []uint64, fsm FSM, ss snapshotStorage, propose
 
 	go rc.startRaft()
 	return rc
-}
-
-func (rc *raftNode) loadAndApplySnapshot() {
-	snapshot, err := rc.ss.load()
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return
-		}
-		log.Panic(err)
-	}
-	log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
-	if err := rc.fsm.RestoreSnapshot(snapshot.Data); err != nil {
-		log.Panic(err)
-	}
 }
 
 func (rc *raftNode) startRaft() {
@@ -135,6 +120,24 @@ func (rc *raftNode) startRaft() {
 	}
 
 	go rc.serveChannels()
+}
+
+// loadAndApplySnapshot loads the most recent snapshot from the
+// snapshot storage (if any) and applies it to the current state.
+func (rc *raftNode) loadAndApplySnapshot() {
+	// snapshot, err := rc.snapshotStorage.Load()
+	// if err != nil {
+	// 	if err == snap.ErrNoSnapshot {
+	// 		// No snapshots available; do nothing.
+	// 		return
+	// 	}
+	// 	log.Panic(err)
+	// }
+
+	// log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
+	// if err := rc.fsm.RestoreSnapshot(snapshot.Data); err != nil {
+	// 	log.Panic(err)
+	// }
 }
 
 func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
@@ -250,7 +253,7 @@ func (rc *raftNode) serveChannels() {
 			}
 			rc.raftStorage.Append(rd.Entries)
 
-			rc.nw.send(rd.Messages)
+			rc.t.send(rd.Messages)
 
 			// apply committedEntries
 			data := make([]string, 0, len(rd.CommittedEntries))
@@ -268,14 +271,15 @@ func (rc *raftNode) serveChannels() {
 					cc.Unmarshal(entry.Data)
 					rc.node.ApplyConfChange(cc)
 					switch cc.Type {
-					// case raftpb.ConfChangeAddNode:
+					case raftpb.ConfChangeAddNode:
+						rc.t.addPeer(cc.NodeID)
 					case raftpb.ConfChangeRemoveNode:
 						if cc.NodeID == rc.id {
 							log.Printf("Node %d: I've been removed from the cluster! Shutting down.", rc.id)
 							rc.stop()
 							return
 						}
-						rc.nw.removePeer(cc.NodeID)
+						rc.t.removePeer(cc.NodeID)
 					}
 				}
 			}
@@ -328,10 +332,9 @@ func (rc *raftNode) processCommits() error {
 
 func (rc *raftNode) stop() {
 	log.Printf("node %d: Executing stop()\n", rc.id)
-	// TODO: stop the network layer
-	// TODO: stop the KVStore HTTP layer
 	close(rc.commitC)
 	close(rc.errorC)
 	close(rc.donec)
+	rc.t.leave()
 	rc.node.Stop()
 }
