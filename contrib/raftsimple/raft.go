@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
+	"os"
 	"time"
 
 	"go.etcd.io/raft/v3"
@@ -125,19 +127,19 @@ func (rc *raftNode) startRaft() {
 // loadAndApplySnapshot loads the most recent snapshot from the
 // snapshot storage (if any) and applies it to the current state.
 func (rc *raftNode) loadAndApplySnapshot() {
-	// snapshot, err := rc.snapshotStorage.Load()
-	// if err != nil {
-	// 	if err == snap.ErrNoSnapshot {
-	// 		// No snapshots available; do nothing.
-	// 		return
-	// 	}
-	// 	log.Panic(err)
-	// }
+	snapshot, err := rc.ss.load()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// No snapshots available; do nothing.
+			return
+		}
+		log.Panic(err)
+	}
 
-	// log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
-	// if err := rc.fsm.RestoreSnapshot(snapshot.Data); err != nil {
-	// 	log.Panic(err)
-	// }
+	log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
+	if err := rc.fsm.RestoreSnapshot(snapshot.Data); err != nil {
+		log.Panic(err)
+	}
 }
 
 func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
